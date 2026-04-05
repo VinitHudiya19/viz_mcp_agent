@@ -3,35 +3,25 @@ sandbox/executor.py
 ────────────────────────────────────────────────────────────────────────────
 E2B Sandbox Executor for viz_mcp_agent.
 
-Optional isolation layer — NOT used by the MCP server in normal operation.
-The MCP server renders charts directly (in-process matplotlib).
-This module exists as a drop-in upgrade for production environments where
-data isolation is required (e.g. untrusted datasets, multi-tenant hosting).
+Isolation layer for chart rendering.  When enabled, instead of running
+matplotlib in the MCP server process, the executor:
 
-Architecture Fit
-─────────────────
-The current multi-agent system works as:
+  1. Boots a long-lived E2B cloud sandbox.
+  2. Uploads project source files (core/, tools/) once per session.
+  3. Installs Python deps (matplotlib, seaborn, etc.) once per session.
+  4. For each tool call: serialises data → generates render script →
+     executes in sandbox → downloads PNG → returns base64.
 
-  Orchestrator → mcp_server.py → TOOL_REGISTRY[tool](data) → base64 PNG
-                                 ↑ direct function call (local)
-
-With the sandbox, the flow becomes:
-
-  Orchestrator → mcp_server.py → SandboxExecutor.run_tool(tool, data)
-                                 ↑ serialises data as JSON → ships to E2B
-                                 ↑ executes render script remotely
-                                 ↑ downloads PNG → base64
-
-Usage (optional — plug into mcp_server.py when needed)
-──────────────────────────────────────────────────────────
+Usage
+──────
     from sandbox.executor import SandboxExecutor
 
     with SandboxExecutor() as executor:
         png_b64 = executor.run_tool(
             tool_name="bar_chart",
-            data={"x_col": [...], "y_col": [...], "x_col_name": "Month"},
+            data={"x_col": [...], "y_col": [...]},
             title="Monthly Revenue",
-            options={"color": "#4C72B0", "show_values": True},
+            options={"color": "#4C72B0"},
         )
 
 Environment variables
@@ -49,11 +39,11 @@ import os
 import textwrap
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # E2B import — lazy so the rest of the codebase works without e2b installed.
-# The ImportError is only raised when SandboxExecutor is actually instantiated.
 # ---------------------------------------------------------------------------
 _e2b_available = True
 try:
@@ -76,6 +66,15 @@ _SANDBOX_DEPS = [
 _REMOTE_WORKDIR = "/home/user/viz_agent"
 _REMOTE_OUT_DIR = f"{_REMOTE_WORKDIR}/out"
 
+# Project source files to upload to the sandbox
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_SOURCE_FILES = [
+    "core/__init__.py",
+    "core/base_tool.py",
+    "tools/__init__.py",
+    "tools/visualizations.py",
+]
+
 # ---------------------------------------------------------------------------
 
 
@@ -87,25 +86,20 @@ class SandboxExecutor:
     """
     Manages one long-lived E2B sandbox for isolated chart rendering.
 
-    Instead of running matplotlib in the MCP server process, this class:
-    1. Serialises the data dict + tool params as JSON.
-    2. Generates a self-contained Python render script.
-    3. Uploads and executes it inside an E2B cloud sandbox.
-    4. Downloads the output PNG and returns it as base64.
-
-    The sandbox is created lazily on first use and reused across calls.
-    Call `close()` (or use as a context manager) to shut it down.
+    The sandbox is created lazily on first use and reused across calls
+    (avoiding ~2s cold start per request). Project source files and
+    dependencies are uploaded/installed once per session.
 
     Parameters
     ----------
     timeout :
-        Sandbox idle timeout in seconds (default: SANDBOX_TIMEOUT env or 300).
+        Sandbox idle timeout in seconds.
     template :
-        E2B sandbox template (default: SANDBOX_TEMPLATE env or "base").
+        E2B sandbox template.
     api_key :
-        E2B API key (default: E2B_API_KEY env).
+        E2B API key.
     verbose :
-        Print debug output to the terminal.
+        Print debug output to terminal.
     """
 
     def __init__(
@@ -117,7 +111,7 @@ class SandboxExecutor:
     ) -> None:
         if not _e2b_available:
             raise ImportError(
-                "e2b package not found. Install it with:  pip install e2b"
+                "e2b package not found. Install it with:  pip install 'e2b>=0.17'"
             )
 
         self.timeout  = timeout or int(os.getenv("SANDBOX_TIMEOUT", 300))
@@ -128,11 +122,12 @@ class SandboxExecutor:
         if not self.api_key:
             raise EnvironmentError(
                 "E2B_API_KEY is not set. "
-                "Export it as an environment variable or pass api_key=... explicitly."
+                "Export it or pass api_key=... explicitly."
             )
 
         self._sandbox: Optional[Sandbox] = None
         self._deps_installed: bool = False
+        self._sources_uploaded: bool = False
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -140,24 +135,24 @@ class SandboxExecutor:
         """Create the sandbox if it doesn't exist yet."""
         if self._sandbox is None:
             if self.verbose:
-                print("[executor] Booting E2B sandbox ...")
+                print("[sandbox] Booting E2B sandbox ...")
             self._sandbox = Sandbox(
                 template=self.template,
                 api_key=self.api_key,
                 timeout=self.timeout,
             )
-            self._run_cmd(f"mkdir -p {_REMOTE_OUT_DIR}")
+            self._run_cmd(f"mkdir -p {_REMOTE_WORKDIR}/core {_REMOTE_WORKDIR}/tools {_REMOTE_OUT_DIR}")
             if self.verbose:
-                print(f"[executor] Sandbox id: {self._sandbox.id}")
+                print(f"[sandbox] Sandbox id: {self._sandbox.id}")
         return self._sandbox
 
     def _ensure_deps(self) -> None:
-        """pip-install required packages exactly once per sandbox lifetime."""
+        """pip-install required packages once per sandbox lifetime."""
         if self._deps_installed:
             return
         deps_str = " ".join(_SANDBOX_DEPS)
         if self.verbose:
-            print(f"[executor] Installing deps: {deps_str}")
+            print(f"[sandbox] Installing deps: {deps_str}")
         result = self._run_cmd(
             f"pip install --quiet {deps_str}",
             timeout=120,
@@ -168,8 +163,27 @@ class SandboxExecutor:
             )
         self._deps_installed = True
 
+    def _ensure_sources(self) -> None:
+        """Upload project source files (core/, tools/) once per sandbox."""
+        if self._sources_uploaded:
+            return
+        sandbox = self._ensure_sandbox()
+        if self.verbose:
+            print("[sandbox] Uploading project source files ...")
+        for rel_path in _SOURCE_FILES:
+            local_path = _PROJECT_ROOT / rel_path
+            remote_path = f"{_REMOTE_WORKDIR}/{rel_path}"
+            if local_path.exists():
+                content = local_path.read_bytes()
+                sandbox.files.write(remote_path, content)
+                if self.verbose:
+                    print(f"  -> {rel_path} ({len(content)} bytes)")
+            else:
+                print(f"  [WARN] Missing: {local_path}")
+        self._sources_uploaded = True
+
     def close(self) -> None:
-        """Explicitly shut down the sandbox and free resources."""
+        """Shut down the sandbox and free resources."""
         if self._sandbox is not None:
             try:
                 self._sandbox.kill()
@@ -178,6 +192,7 @@ class SandboxExecutor:
             finally:
                 self._sandbox = None
                 self._deps_installed = False
+                self._sources_uploaded = False
 
     def __del__(self) -> None:
         self.close()
@@ -191,22 +206,22 @@ class SandboxExecutor:
     # ── internal helpers ─────────────────────────────────────────────────────
 
     def _run_cmd(self, cmd: str, timeout: int = 60):
-        """Run a shell command in the sandbox and return the result."""
+        """Run a shell command in the sandbox."""
         sandbox = self._ensure_sandbox()
         return sandbox.commands.run(cmd, timeout=timeout)
 
     def _upload_script(self, source: str) -> str:
-        """Write source to a uniquely named .py file inside the sandbox."""
+        """Write source to a .py file inside the sandbox."""
         script_name = f"render_{uuid.uuid4().hex[:8]}.py"
         remote_path = f"{_REMOTE_WORKDIR}/{script_name}"
         sandbox = self._ensure_sandbox()
         sandbox.files.write(remote_path, source.encode())
         return remote_path
 
-    def _download_png(self, remote_png_path: str) -> bytes:
-        """Read the rendered PNG back from the sandbox."""
+    def _download_png(self, remote_path: str) -> bytes:
+        """Read the rendered PNG from the sandbox."""
         sandbox = self._ensure_sandbox()
-        return sandbox.files.read(remote_png_path)
+        return sandbox.files.read(remote_path)
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -218,41 +233,32 @@ class SandboxExecutor:
         options: dict[str, Any] | None = None,
     ) -> str:
         """
-        Execute a visualization tool inside the sandbox and return base64 PNG.
-
-        This method:
-        1. Serialises `data` and `options` as JSON.
-        2. Generates a self-contained Python script that imports the tool
-           from `tools.visualizations`, reconstructs the numpy arrays,
-           calls the tool function, and saves the figure.
-        3. Uploads and runs the script inside E2B.
-        4. Downloads the output PNG and returns base64.
+        Execute a visualization tool inside the E2B sandbox.
 
         Parameters
         ----------
         tool_name :
             Registry key (e.g. "bar_chart", "scatter_plot").
         data :
-            Dict of column arrays — values must be JSON-serialisable lists.
-            Example: {"x_col": [1, 2, 3], "y_col": [10, 20, 30]}
+            Dict of column arrays. Values can be lists or numpy arrays.
         title :
-            Chart title string.
+            Chart title.
         options :
-            Extra kwargs passed to the tool function
-            (e.g. {"color": "#4C72B0", "show_values": True}).
+            Extra kwargs for the tool function.
 
         Returns
         -------
         str
-            Base64-encoded PNG (no data-URI prefix).
+            Base64-encoded PNG string.
         """
         options = options or {}
 
-        # 1. Ensure sandbox + deps
+        # 1. Boot sandbox + install deps + upload source files
         self._ensure_sandbox()
         self._ensure_deps()
+        self._ensure_sources()
 
-        # 2. Generate the render script
+        # 2. Generate render script
         output_name = f"chart_{uuid.uuid4().hex[:8]}.png"
         remote_out = f"{_REMOTE_OUT_DIR}/{output_name}"
         render_script = _build_render_script(
@@ -263,15 +269,14 @@ class SandboxExecutor:
             output_path=remote_out,
         )
 
-        # 3. Upload script
+        # 3. Upload + execute
         remote_script = self._upload_script(render_script)
 
-        # 4. Execute
         if self.verbose:
-            print(f"[executor] Running {tool_name} in sandbox ...")
+            print(f"[sandbox] Running {tool_name} ...")
 
         t0 = time.monotonic()
-        result = self._run_cmd(f"python {remote_script}", timeout=60)
+        result = self._run_cmd(f"cd {_REMOTE_WORKDIR} && python {remote_script}", timeout=60)
         elapsed = time.monotonic() - t0
 
         if self.verbose:
@@ -279,7 +284,7 @@ class SandboxExecutor:
                 print("[sandbox stdout]\n", textwrap.indent(result.stdout, "  "))
             if result.stderr:
                 print("[sandbox stderr]\n", textwrap.indent(result.stderr, "  "))
-            print(f"[executor] Finished in {elapsed:.2f}s  exit={result.exit_code}")
+            print(f"[sandbox] Finished in {elapsed:.2f}s  exit={result.exit_code}")
 
         if result.exit_code != 0:
             raise SandboxExecutionError(
@@ -287,7 +292,7 @@ class SandboxExecutor:
                 f"{result.stderr or result.stdout}"
             )
 
-        # 5. Download PNG and base64-encode
+        # 4. Download PNG → base64
         png_bytes = self._download_png(remote_out)
         return base64.b64encode(png_bytes).decode("utf-8")
 
@@ -297,7 +302,7 @@ class SandboxExecutor:
 # ---------------------------------------------------------------------------
 
 def _serialise_for_json(data: dict[str, Any]) -> dict[str, Any]:
-    """Convert numpy arrays to lists for JSON serialisation."""
+    """Convert numpy arrays to JSON-safe lists."""
     import numpy as np
 
     out = {}
@@ -305,7 +310,6 @@ def _serialise_for_json(data: dict[str, Any]) -> dict[str, Any]:
         if isinstance(v, np.ndarray):
             out[k] = v.tolist()
         elif isinstance(v, dict):
-            # nested dict (e.g. correlation_matrix "columns" key)
             out[k] = _serialise_for_json(v)
         else:
             out[k] = v
@@ -320,45 +324,41 @@ def _build_render_script(
     output_path: str,
 ) -> str:
     """
-    Generate a self-contained Python script that the sandbox can execute.
+    Generate a self-contained Python script for the sandbox.
 
-    The script:
-    1. Imports matplotlib + numpy
-    2. Reconstructs the data dict from embedded JSON
-    3. Calls the tool function from tools.visualizations
-    4. Saves the figure to OUTPUT_PATH
+    The script imports the @viz_tool functions from the uploaded project
+    files, reconstructs numpy arrays from embedded JSON, runs the tool,
+    and saves the output PNG.
     """
-    serialised_data = _serialise_for_json(data)
-    data_json = json.dumps(serialised_data, default=str)
+    serialised = _serialise_for_json(data)
+    data_json = json.dumps(serialised, default=str)
     options_json = json.dumps(options, default=str)
 
     script = textwrap.dedent(f"""\
         #!/usr/bin/env python3
-        # ── Auto-generated sandbox render script ──────────────────────────────
+        # ── Auto-generated sandbox render script ──
         # Tool: {tool_name}
-        # ───────────────────────────────────────────────────────────────────────
+        # ───────────────────────────────────────────
 
         import json
         import sys
         import os
+        import base64
 
         import matplotlib
         matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
         import numpy as np
 
-        # ── Reconstruct data from embedded JSON ──────────────────────────────
-        _raw_data = json.loads('''{data_json}''')
+        # ── Reconstruct data from JSON ────────────
+        _raw = json.loads('''{data_json}''')
 
-        # Convert lists back to numpy arrays
         data = {{}}
-        for key, val in _raw_data.items():
+        for key, val in _raw.items():
             if isinstance(val, list) and len(val) > 0 and isinstance(val[0], (int, float)):
                 data[key] = np.array(val, dtype=float)
             elif isinstance(val, list):
                 data[key] = np.array(val)
             elif isinstance(val, dict):
-                # nested dict (correlation matrix columns)
                 data[key] = {{k: np.array(v, dtype=float) for k, v in val.items()}}
             else:
                 data[key] = val
@@ -367,24 +367,19 @@ def _build_render_script(
         options = json.loads('''{options_json}''')
         OUTPUT_PATH = {output_path!r}
 
-        # ── Import and call the tool ─────────────────────────────────────────
-        # Add project root so imports work
-        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+        # ── Import tool from uploaded project files ──
         from core.base_tool import TOOL_REGISTRY
-        import tools.visualizations  # triggers @viz_tool registration
+        import tools.visualizations
 
         tool_fn = TOOL_REGISTRY[{tool_name!r}]
         result = tool_fn(data, title, **options)
 
         if result.success:
-            # Save the image bytes directly
             with open(OUTPUT_PATH, "wb") as f:
-                import base64
                 f.write(base64.b64decode(result.image_b64))
-            print(f"Chart saved to {{OUTPUT_PATH}}")
+            print(f"OK: {{OUTPUT_PATH}}")
         else:
-            print(f"Tool error: {{result.error}}", file=sys.stderr)
+            print(f"FAIL: {{result.error}}", file=sys.stderr)
             sys.exit(1)
     """)
 

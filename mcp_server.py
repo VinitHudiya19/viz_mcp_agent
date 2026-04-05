@@ -37,6 +37,32 @@ from core.base_tool import TOOL_REGISTRY, ToolResult
 logger = logging.getLogger("viz_mcp_agent")
 logging.basicConfig(level=logging.INFO, format="%(name)s | %(levelname)s | %(message)s")
 
+# ── Sandbox mode ─────────────────────────────────────────────────────────────
+# Set USE_SANDBOX=true in .env to route all rendering through E2B cloud sandbox.
+# Default: false (local in-process matplotlib — faster, no API key needed).
+USE_SANDBOX = os.getenv("USE_SANDBOX", "false").lower() in ("true", "1", "yes")
+
+_sandbox_executor = None  # lazy init
+
+if USE_SANDBOX:
+    try:
+        from sandbox.executor import SandboxExecutor, SandboxExecutionError
+        logger.info("Sandbox mode ENABLED — charts will render in E2B cloud")
+    except ImportError as e:
+        logger.error(f"Sandbox mode requested but e2b not installed: {e}")
+        logger.info("Falling back to local execution")
+        USE_SANDBOX = False
+
+
+def _get_sandbox() -> "SandboxExecutor":
+    """Lazy-initialise the shared SandboxExecutor instance."""
+    global _sandbox_executor
+    if _sandbox_executor is None:
+        _sandbox_executor = SandboxExecutor(
+            verbose=os.getenv("SANDBOX_VERBOSE", "false").lower() in ("true", "1"),
+        )
+    return _sandbox_executor
+
 
 # ── MCP server instance ─────────────────────────────────────────────────────
 
@@ -73,12 +99,11 @@ def bar_chart(
         "x_col_name": x_label,
         "y_col_name": y_label,
     }
-    result: ToolResult = TOOL_REGISTRY["bar_chart"](
-        data, title,
+    return _execute_tool(
+        "bar_chart", data, title,
         color=color, show_values=show_values,
         sort_bars=sort_bars, orientation=orientation,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -106,11 +131,10 @@ def line_chart(
     if group_values is not None:
         data["group_col"] = np.array(group_values)
 
-    result: ToolResult = TOOL_REGISTRY["line_chart"](
-        data, title,
+    return _execute_tool(
+        "line_chart", data, title,
         show_markers=show_markers, show_area=show_area,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -141,12 +165,11 @@ def scatter_plot(
     if size_values is not None:
         data["size_col"] = np.array(size_values, dtype=float)
 
-    result: ToolResult = TOOL_REGISTRY["scatter_plot"](
-        data, title,
+    return _execute_tool(
+        "scatter_plot", data, title,
         show_regression=show_regression,
         show_correlation=show_correlation,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -168,13 +191,12 @@ def histogram(
         "x_col": np.array(x_values, dtype=float),
         "x_col_name": x_label,
     }
-    result: ToolResult = TOOL_REGISTRY["histogram"](
-        data, title,
+    return _execute_tool(
+        "histogram", data, title,
         bins=bins if bins > 0 else "auto",
         show_kde=show_kde, show_stats=show_stats,
         show_percentiles=show_percentiles,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -198,11 +220,10 @@ def box_plot(
         "group_col_name": group_label,
         "value_col_name": value_label,
     }
-    result: ToolResult = TOOL_REGISTRY["box_plot"](
-        data, title,
+    return _execute_tool(
+        "box_plot", data, title,
         show_points=show_points, show_means=show_means, orient=orient,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -231,11 +252,10 @@ def heatmap(
         "col_col_name": col_label,
         "value_col_name": value_label,
     }
-    result: ToolResult = TOOL_REGISTRY["heatmap"](
-        data, title,
+    return _execute_tool(
+        "heatmap", data, title,
         aggfunc=aggfunc, cmap=cmap, annot=annot,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -259,11 +279,10 @@ def pie_chart(
     if value_values is not None:
         data["value_col"] = np.array(value_values, dtype=float)
 
-    result: ToolResult = TOOL_REGISTRY["pie_chart"](
-        data, title,
+    return _execute_tool(
+        "pie_chart", data, title,
         donut=donut, show_pct=show_pct, show_legend=show_legend,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -291,11 +310,10 @@ def area_chart(
     if group_values is not None:
         data["group_col"] = np.array(group_values)
 
-    result: ToolResult = TOOL_REGISTRY["area_chart"](
-        data, title,
+    return _execute_tool(
+        "area_chart", data, title,
         stacked=stacked, show_lines=show_lines,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -323,11 +341,10 @@ def stacked_bar_chart(
         "y_col_name": y_label,
         "group_col_name": group_label,
     }
-    result: ToolResult = TOOL_REGISTRY["stacked_bar_chart"](
-        data, title,
+    return _execute_tool(
+        "stacked_bar_chart", data, title,
         orientation=orientation, show_values=show_values, show_totals=show_totals,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -353,11 +370,10 @@ def grouped_bar_chart(
         "y_col_name": y_label,
         "group_col_name": group_label,
     }
-    result: ToolResult = TOOL_REGISTRY["grouped_bar_chart"](
-        data, title,
+    return _execute_tool(
+        "grouped_bar_chart", data, title,
         show_values=show_values, orientation=orientation,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -376,11 +392,10 @@ def correlation_matrix(
     # Convert each list to numpy array
     converted = {k: np.array(v, dtype=float) for k, v in columns_data.items()}
     data = {"columns": converted}
-    result: ToolResult = TOOL_REGISTRY["correlation_matrix"](
-        data, title,
+    return _execute_tool(
+        "correlation_matrix", data, title,
         method=method, annot=annot, mask_upper=mask_upper,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -408,12 +423,11 @@ def count_plot(
         data["group_col"] = np.array(group_values)
         data["group_col_name"] = group_label
 
-    result: ToolResult = TOOL_REGISTRY["count_plot"](
-        data, title,
+    return _execute_tool(
+        "count_plot", data, title,
         show_values=show_values, show_pct=show_pct,
         sort_by_count=sort_by_count, orientation=orientation,
     )
-    return _format_result(result)
 
 
 @mcp.tool()
@@ -442,11 +456,10 @@ def dual_axis_time_series(
         "y1_col_name": y1_label,
         "y2_col_name": y2_label,
     }
-    result: ToolResult = TOOL_REGISTRY["dual_axis_time_series"](
-        data, title,
+    return _execute_tool(
+        "dual_axis_time_series", data, title,
         y1_style=y1_style, y2_style=y2_style, show_markers=show_markers,
     )
-    return _format_result(result)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -478,8 +491,8 @@ def list_available_charts() -> str:
 def _format_result(result: ToolResult) -> str:
     """
     Convert a ToolResult into the string returned to the MCP caller.
-    On success → JSON with base64 image + metadata.
-    On failure → JSON with error message.
+    On success -> JSON with base64 image + metadata.
+    On failure -> JSON with error message.
     """
     if result.success:
         return json.dumps({
@@ -494,14 +507,55 @@ def _format_result(result: ToolResult) -> str:
         })
 
 
+def _execute_tool(
+    tool_name: str,
+    data: dict[str, Any],
+    title: str,
+    **options,
+) -> str:
+    """
+    Unified execution router.
+
+    - USE_SANDBOX=false (default): calls TOOL_REGISTRY directly (local).
+    - USE_SANDBOX=true: sends work to E2B sandbox (cloud).
+
+    Returns JSON string with {success, image_base64, metadata} or {error}.
+    """
+    if USE_SANDBOX:
+        try:
+            executor = _get_sandbox()
+            png_b64 = executor.run_tool(
+                tool_name=tool_name,
+                data=data,
+                title=title,
+                options=options,
+            )
+            return json.dumps({
+                "success": True,
+                "image_base64": png_b64,
+                "metadata": {"rendered_in": "e2b_sandbox"},
+            })
+        except Exception as e:
+            logger.error(f"Sandbox execution failed for {tool_name}: {e}")
+            return json.dumps({
+                "success": False,
+                "error": f"Sandbox error: {str(e)}",
+            })
+    else:
+        # Local execution (default)
+        result: ToolResult = TOOL_REGISTRY[tool_name](data, title, **options)
+        return _format_result(result)
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    logger.info("Starting viz-agent MCP server (stdio transport)…")
+    mode = "SANDBOX (E2B)" if USE_SANDBOX else "LOCAL (in-process)"
+    logger.info(f"Starting viz-agent MCP server  |  rendering: {mode}")
     logger.info(f"Registered tools: {list(TOOL_REGISTRY.keys())}")
-    
+
     # Current (local only):
     mcp.run(transport="stdio")
 
