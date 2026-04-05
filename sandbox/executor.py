@@ -136,14 +136,14 @@ class SandboxExecutor:
         if self._sandbox is None:
             if self.verbose:
                 print("[sandbox] Booting E2B sandbox ...")
-            self._sandbox = Sandbox(
+            self._sandbox = Sandbox.create(
                 template=self.template,
                 api_key=self.api_key,
                 timeout=self.timeout,
             )
             self._run_cmd(f"mkdir -p {_REMOTE_WORKDIR}/core {_REMOTE_WORKDIR}/tools {_REMOTE_OUT_DIR}")
             if self.verbose:
-                print(f"[sandbox] Sandbox id: {self._sandbox.id}")
+                print(f"[sandbox] Sandbox id: {self._sandbox.sandbox_id}")
         return self._sandbox
 
     def _ensure_deps(self) -> None:
@@ -221,7 +221,7 @@ class SandboxExecutor:
     def _download_png(self, remote_path: str) -> bytes:
         """Read the rendered PNG from the sandbox."""
         sandbox = self._ensure_sandbox()
-        return sandbox.files.read(remote_path)
+        return sandbox.files.read(remote_path, format="bytes")
 
     # ── public API ───────────────────────────────────────────────────────────
 
