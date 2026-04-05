@@ -1,0 +1,17 @@
+# viz_mcp_agent — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# ── MCP server ───────────────────────────────────────────────────────────────
+mcp>=1.0.0              # Model Context Protocol SDK (FastMCP)
+python-dotenv>=1.0      # .env file loading
+
+# ── data / viz ───────────────────────────────────────────────────────────────
+pandas>=2.0
+pyarrow>=14.0
+numpy>=1.26
+matplotlib>=3.8
+seaborn>=0.13
+scipy>=1.12
+
+# ── E2B sandbox (optional — only if using sandbox execution) ─────────────────
+# e2b>=0.17.0
